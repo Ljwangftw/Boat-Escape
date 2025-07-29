@@ -1,0 +1,2341 @@
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <random>
+#include <cmath>
+#include <map>
+#include <cctype>
+
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
+// Constants & Configurations
+const unsigned int WINDOW_WIDTH = 1024;
+const unsigned int WINDOW_HEIGHT = 768;
+
+// Game boundaries
+const float BOUNDARY_SIZE = 80.0f;
+const float BOUNDARY_HEIGHT = 10.0f;
+const float BOUNDARY_THICKNESS = 2.0f;
+
+// Camera settings
+const float mouseSensitivity = 0.1f;
+
+// Projectile settings
+const float maxShootCooldown = 0.5f;
+
+// Wave animation settings
+const float waveSpeed = 2.0f;
+const float waveHeight = 0.3f;
+const float waveFrequency = 0.5f;
+
+// Menu settings
+const int mainMenuItemCount = 3;
+const int difficultyMenuItemCount = 2;
+const int settingsMenuItemCount = 7;
+const int pauseMenuItemCount = 2;
+const int boatSkinCount = 5;
+
+// Enums & Structs
+enum GameState {
+    MAIN_MENU,
+    DIFFICULTY_MENU,
+    SETTINGS_MENU,
+    PLAYING,
+    PAUSED,
+    GAME_OVER
+};
+
+enum Difficulty {
+    EASY,
+    HARD
+};
+
+struct EnemyBoat {
+    glm::vec3 position;
+    float rotation;
+    float speed;
+    bool active;
+    float shootCooldown;
+    float maxShootCooldown;
+    
+    EnemyBoat(glm::vec3 pos) : position(pos), rotation(0.0f), speed(2.0f), active(true), 
+                               shootCooldown(0.0f), maxShootCooldown(2.0f) {}
+};
+
+struct EnhancedProjectile {
+    glm::vec3 position;
+    glm::vec3 velocity;
+    bool active;
+    float lifetime;
+    bool isPlayerOwned;
+    std::vector<glm::vec3> smokeTrail;
+    float smokeTimer;
+    
+    EnhancedProjectile(glm::vec3 pos, glm::vec3 vel, bool playerOwned) 
+        : position(pos), velocity(vel), active(true), lifetime(5.0f), 
+          isPlayerOwned(playerOwned), smokeTimer(0.0f) {}
+};
+
+// Shader Sources
+const char* vertexShaderSource = R"(
+#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec3 aNormal;
+layout (location = 2) in vec2 aTexCoord;
+
+out vec3 FragPos;
+out vec3 Normal;
+out vec3 WorldPos;
+out vec2 TexCoord;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+void main() {
+    FragPos = vec3(model * vec4(aPos, 1.0));
+    Normal = mat3(transpose(inverse(model))) * aNormal;
+    WorldPos = FragPos;
+    TexCoord = aTexCoord;
+    gl_Position = projection * view * vec4(FragPos, 1.0);
+}
+)";
+
+const char* fragmentShaderSource = R"(
+#version 330 core
+out vec4 FragColor;
+
+in vec3 FragPos;
+in vec3 Normal;
+in vec3 WorldPos;
+in vec2 TexCoord;
+
+uniform vec3 lightPos;
+uniform vec3 lightColor;
+uniform vec3 viewPos;
+uniform vec3 objectColor;
+uniform float time;
+uniform bool isWater;
+uniform sampler2D texture1;
+
+void main() {
+    // Enhanced lighting with sunlight effect
+    float ambientStrength = 0.4;
+    vec3 ambient = ambientStrength * lightColor;
+    
+    // Diffuse
+    vec3 norm = normalize(Normal);
+    vec3 lightDir = normalize(lightPos - FragPos);
+    float diff = max(dot(norm, lightDir), 0.0);
+    vec3 diffuse = diff * lightColor;
+    
+    // Specular with enhanced sunlight reflection
+    float specularStrength = isWater ? 0.8 : 0.5;
+    vec3 viewDir = normalize(viewPos - FragPos);
+    vec3 reflectDir = reflect(-lightDir, norm);
+    float spec = pow(max(dot(viewDir, reflectDir), 0.0), isWater ? 64 : 32);
+    vec3 specular = specularStrength * spec * lightColor;
+    vec3 finalColor;
+    
+    // Water animation with sunlight sparkles
+    if (isWater) {
+        float wave1 = sin(WorldPos.x * 0.1 + time * 2.0) * 0.5 + 0.5;
+        float wave2 = cos(WorldPos.z * 0.15 + time * 1.5) * 0.5 + 0.5;
+        float sparkle = wave1 * wave2;
+        
+        // Add sunlight sparkles
+        vec3 sparkleColor = vec3(1.0, 1.0, 0.8) * sparkle * 0.3;
+        finalColor = objectColor + sparkleColor;
+        
+        // Enhanced water reflection
+        specular *= (1.0 + sparkle * 0.5);
+    } else {
+        finalColor = texture(texture1, TexCoord).rgb * objectColor;
+    }
+    
+    vec3 result = (ambient + diffuse + specular) * finalColor;
+    FragColor = vec4(result, 1.0);
+}
+)";
+
+const char* textVertexShaderSource = R"(
+#version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aTexCoord;
+
+out vec2 TexCoord;
+
+uniform mat4 projection;
+uniform mat4 model;
+
+void main() {
+    gl_Position = projection * model * vec4(aPos, 0.0, 1.0);
+    TexCoord = aTexCoord;
+}
+)";
+
+const char* textFragmentShaderSource = R"(
+#version 330 core
+out vec4 FragColor;
+
+in vec2 TexCoord;
+
+uniform vec3 textColor;
+
+void main() {
+    FragColor = vec4(textColor, 1.0);
+}
+)";
+
+// Vertex Data
+
+// Ship hull vertices
+float shipVertices[] = {
+   
+    // Hull bottom (boat-like shape)
+    // Front triangle (pointed bow)
+     0.0f, -0.3f,  1.0f,  0.0f, -0.7f,  0.7f,  // bow point
+    -0.4f, -0.3f,  0.5f, -0.7f, -0.7f,  0.0f,  // left front
+     0.4f, -0.3f,  0.5f,  0.7f, -0.7f,  0.0f,  // right front
+    
+    // Hull sides (left)
+    -0.4f, -0.3f,  0.5f, -1.0f,  0.0f,  0.0f,
+    -0.4f, -0.3f, -0.8f, -1.0f,  0.0f,  0.0f,
+    -0.4f,  0.2f,  0.5f, -1.0f,  0.0f,  0.0f,
+    -0.4f,  0.2f,  0.5f, -1.0f,  0.0f,  0.0f,
+    -0.4f, -0.3f, -0.8f, -1.0f,  0.0f,  0.0f,
+    -0.4f,  0.2f, -0.8f, -1.0f,  0.0f,  0.0f,
+    
+    // Hull sides (right)
+     0.4f, -0.3f,  0.5f,  1.0f,  0.0f,  0.0f,
+     0.4f,  0.2f,  0.5f,  1.0f,  0.0f,  0.0f,
+     0.4f, -0.3f, -0.8f,  1.0f,  0.0f,  0.0f,
+     0.4f,  0.2f,  0.5f,  1.0f,  0.0f,  0.0f,
+     0.4f,  0.2f, -0.8f,  1.0f,  0.0f,  0.0f,
+     0.4f, -0.3f, -0.8f,  1.0f,  0.0f,  0.0f,
+    
+    // Hull back (stern)
+    -0.4f, -0.3f, -0.8f,  0.0f,  0.0f, -1.0f,
+     0.4f, -0.3f, -0.8f,  0.0f,  0.0f, -1.0f,
+     0.4f,  0.2f, -0.8f,  0.0f,  0.0f, -1.0f,
+     0.4f,  0.2f, -0.8f,  0.0f,  0.0f, -1.0f,
+    -0.4f,  0.2f, -0.8f,  0.0f,  0.0f, -1.0f,
+    -0.4f, -0.3f, -0.8f,  0.0f,  0.0f, -1.0f,
+    
+    // Deck (top)
+    -0.3f,  0.2f,  0.4f,  0.0f,  1.0f,  0.0f,
+     0.3f,  0.2f,  0.4f,  0.0f,  1.0f,  0.0f,
+     0.3f,  0.2f, -0.6f,  0.0f,  1.0f,  0.0f,
+     0.3f,  0.2f, -0.6f,  0.0f,  1.0f,  0.0f,
+    -0.3f,  0.2f, -0.6f,  0.0f,  1.0f,  0.0f,
+    -0.3f,  0.2f,  0.4f,  0.0f,  1.0f,  0.0f,
+    
+    // Cabin/Superstructure
+    -0.2f,  0.2f,  0.1f,  0.0f,  0.0f,  1.0f,
+     0.2f,  0.2f,  0.1f,  0.0f,  0.0f,  1.0f,
+     0.2f,  0.5f,  0.1f,  0.0f,  0.0f,  1.0f,
+     0.2f,  0.5f,  0.1f,  0.0f,  0.0f,  1.0f,
+    -0.2f,  0.5f,  0.1f,  0.0f,  0.0f,  1.0f,
+    -0.2f,  0.2f,  0.1f,  0.0f,  0.0f,  1.0f,
+    
+    -0.2f,  0.2f, -0.3f,  0.0f,  0.0f, -1.0f,
+     0.2f,  0.5f, -0.3f,  0.0f,  0.0f, -1.0f,
+     0.2f,  0.2f, -0.3f,  0.0f,  0.0f, -1.0f,
+     0.2f,  0.5f, -0.3f,  0.0f,  0.0f, -1.0f,
+    -0.2f,  0.2f, -0.3f,  0.0f,  0.0f, -1.0f,
+    -0.2f,  0.5f, -0.3f,  0.0f,  0.0f, -1.0f,
+    
+    // Cabin sides
+    -0.2f,  0.2f,  0.1f, -1.0f,  0.0f,  0.0f,
+    -0.2f,  0.2f, -0.3f, -1.0f,  0.0f,  0.0f,
+    -0.2f,  0.5f, -0.3f, -1.0f,  0.0f,  0.0f,
+    -0.2f,  0.5f, -0.3f, -1.0f,  0.0f,  0.0f,
+    -0.2f,  0.5f,  0.1f, -1.0f,  0.0f,  0.0f,
+    -0.2f,  0.2f,  0.1f, -1.0f,  0.0f,  0.0f,
+    
+     0.2f,  0.2f,  0.1f,  1.0f,  0.0f,  0.0f,
+     0.2f,  0.5f, -0.3f,  1.0f,  0.0f,  0.0f,
+     0.2f,  0.2f, -0.3f,  1.0f,  0.0f,  0.0f,
+     0.2f,  0.5f, -0.3f,  1.0f,  0.0f,  0.0f,
+     0.2f,  0.2f,  0.1f,  1.0f,  0.0f,  0.0f,
+     0.2f,  0.5f,  0.1f,  1.0f,  0.0f,  0.0f,
+    
+    // Cabin top
+    -0.2f,  0.5f,  0.1f,  0.0f,  1.0f,  0.0f,
+     0.2f,  0.5f,  0.1f,  0.0f,  1.0f,  0.0f,
+     0.2f,  0.5f, -0.3f,  0.0f,  1.0f,  0.0f,
+     0.2f,  0.5f, -0.3f,  0.0f,  1.0f,  0.0f,
+    -0.2f,  0.5f, -0.3f,  0.0f,  1.0f,  0.0f,
+    -0.2f,  0.5f,  0.1f,  0.0f,  1.0f,  0.0f
+};
+
+// Cube Vertices for Bullets & Smoke
+float cubeVertices[] = {
+   
+    -0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+     0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+     0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+     0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+    -0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+    -0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+
+    -0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+     0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+    -0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+    -0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+
+    -0.5f,  0.5f,  0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f,  0.5f, -0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f, -0.5f, -0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f, -0.5f, -0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f, -0.5f,  0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f,  0.5f,  0.5f, -1.0f,  0.0f,  0.0f,
+
+     0.5f,  0.5f,  0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f,  0.5f, -0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f, -0.5f, -0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f, -0.5f, -0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f, -0.5f,  0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f,  0.5f,  0.5f,  1.0f,  0.0f,  0.0f,
+
+    -0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,
+     0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,
+     0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,
+     0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,
+    -0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,
+    -0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,
+
+    -0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f,
+     0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,
+    -0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,
+    -0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f
+};
+
+// Water Plane Vertices 
+float waterVertices[] = {
+    
+    -(BOUNDARY_SIZE + BOUNDARY_THICKNESS), -1.0f, -(BOUNDARY_SIZE + BOUNDARY_THICKNESS),  0.0f,  1.0f,  0.0f,  0.0f, 0.0f,
+     (BOUNDARY_SIZE + BOUNDARY_THICKNESS), -1.0f, -(BOUNDARY_SIZE + BOUNDARY_THICKNESS),  0.0f,  1.0f,  0.0f,  10.0f, 0.0f,
+     (BOUNDARY_SIZE + BOUNDARY_THICKNESS), -1.0f,  (BOUNDARY_SIZE + BOUNDARY_THICKNESS),  0.0f,  1.0f,  0.0f,  10.0f, 10.0f,
+     (BOUNDARY_SIZE + BOUNDARY_THICKNESS), -1.0f,  (BOUNDARY_SIZE + BOUNDARY_THICKNESS),  0.0f,  1.0f,  0.0f,  10.0f, 10.0f,
+    -(BOUNDARY_SIZE + BOUNDARY_THICKNESS), -1.0f,  (BOUNDARY_SIZE + BOUNDARY_THICKNESS),  0.0f,  1.0f,  0.0f,  0.0f, 10.0f,
+    -(BOUNDARY_SIZE + BOUNDARY_THICKNESS), -1.0f, -(BOUNDARY_SIZE + BOUNDARY_THICKNESS),  0.0f,  1.0f,  0.0f,  0.0f, 0.0f
+};
+
+// Skybox Vertices 
+float skyboxVertices[] = {
+             
+    -200.0f,  200.0f, -200.0f,
+    -200.0f, -200.0f, -200.0f,
+     200.0f, -200.0f, -200.0f,
+     200.0f, -200.0f, -200.0f,
+     200.0f,  200.0f, -200.0f,
+    -200.0f,  200.0f, -200.0f,
+
+    -200.0f, -200.0f,  200.0f,
+    -200.0f, -200.0f, -200.0f,
+    -200.0f,  200.0f, -200.0f,
+    -200.0f,  200.0f, -200.0f,
+    -200.0f,  200.0f,  200.0f,
+    -200.0f, -200.0f,  200.0f,
+
+     200.0f, -200.0f, -200.0f,
+     200.0f, -200.0f,  200.0f,
+     200.0f,  200.0f,  200.0f,
+     200.0f,  200.0f,  200.0f,
+     200.0f,  200.0f, -200.0f,
+     200.0f, -200.0f, -200.0f,
+
+    -200.0f, -200.0f,  200.0f,
+    -200.0f,  200.0f,  200.0f,
+     200.0f,  200.0f,  200.0f,
+     200.0f,  200.0f,  200.0f,
+     200.0f, -200.0f,  200.0f,
+    -200.0f, -200.0f,  200.0f,
+
+    -200.0f,  200.0f, -200.0f,
+     200.0f,  200.0f, -200.0f,
+     200.0f,  200.0f,  200.0f,
+     200.0f,  200.0f,  200.0f,
+    -200.0f,  200.0f,  200.0f,
+    -200.0f,  200.0f, -200.0f,
+
+    -200.0f, -200.0f, -200.0f,
+    -200.0f, -200.0f,  200.0f,
+     200.0f, -200.0f, -200.0f,
+     200.0f, -200.0f, -200.0f,
+    -200.0f, -200.0f,  200.0f,
+     200.0f, -200.0f,  200.0f
+};
+
+// Character Bitmap Font Data
+
+std::map<char, std::vector<int>> charBitmaps = {
+    {'A', {0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,1,1,1,1, 1,0,0,0,1, 1,0,0,0,1, 0,0,0,0,0}},
+    {'B', {1,1,1,1,0, 1,0,0,0,1, 1,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0}},
+    {'C', {0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'D', {1,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0}},
+    {'E', {1,1,1,1,1, 1,0,0,0,0, 1,1,1,1,0, 1,0,0,0,0, 1,0,0,0,0, 1,1,1,1,1, 0,0,0,0,0}},
+    {'F', {1,1,1,1,1, 1,0,0,0,0, 1,1,1,1,0, 1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 0,0,0,0,0}},
+    {'G', {0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,0, 1,0,1,1,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'H', {1,0,0,0,1, 1,0,0,0,1, 1,1,1,1,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,0,0,0,0}},
+    {'I', {0,1,1,1,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,1,1,1,0, 0,0,0,0,0}},
+    {'K', {1,0,0,0,1, 1,0,0,1,0, 1,0,1,0,0, 1,1,0,0,0, 1,0,1,0,0, 1,0,0,1,0, 0,0,0,0,0}},
+    {'L', {1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 1,1,1,1,1, 0,0,0,0,0}},
+    {'M', {1,0,0,0,1, 1,1,0,1,1, 1,0,1,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,0,0,0,0}},
+    {'N', {1,0,0,0,1, 1,1,0,0,1, 1,0,1,0,1, 1,0,0,1,1, 1,0,0,0,1, 1,0,0,0,1, 0,0,0,0,0}},
+    {'O', {0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'P', {1,1,1,1,0, 1,0,0,0,1, 1,1,1,1,0, 1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 0,0,0,0,0}},
+    {'Q', {0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 1,0,1,0,1, 1,0,0,1,1, 0,1,1,1,1, 0,0,0,0,0}},
+    {'R', {1,1,1,1,0, 1,0,0,0,1, 1,1,1,1,0, 1,0,1,0,0, 1,0,0,1,0, 1,0,0,0,1, 0,0,0,0,0}},
+    {'S', {0,1,1,1,0, 1,0,0,0,0, 0,1,1,0,0, 0,0,0,1,0, 0,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0}},
+    {'T', {1,1,1,1,1, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {'U', {1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'V', {1,0,0,0,1, 1,0,0,0,1, 1,0,0,0,1, 0,1,0,1,0, 0,1,0,1,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {'W', {1,0,0,0,1, 1,0,0,0,1, 1,0,1,0,1, 1,0,1,0,1, 1,1,0,1,1, 1,0,0,0,1, 0,0,0,0,0}},
+    {'X', {1,0,0,0,1, 0,1,0,1,0, 0,0,1,0,0, 0,1,0,1,0, 1,0,0,0,1, 0,0,0,0,0, 0,0,0,0,0}},
+    {'Y', {1,0,0,0,1, 1,0,0,0,1, 0,1,0,1,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {'Z', {1,1,1,1,1, 0,0,0,1,0, 0,0,1,0,0, 0,1,0,0,0, 1,0,0,0,0, 1,1,1,1,1, 0,0,0,0,0}},
+    {' ', {0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0}},
+    {':', {0,0,0,0,0, 0,0,1,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,1,0,0, 0,0,0,0,0, 0,0,0,0,0}},
+    {'/', {0,0,0,0,1, 0,0,0,1,0, 0,0,1,0,0, 0,1,0,0,0, 1,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0}},
+    {'0', {0,1,1,1,0, 1,0,0,0,1, 1,0,0,1,1, 1,0,1,0,1, 1,1,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'1', {0,0,1,0,0, 0,1,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,1,1,1,0, 0,0,0,0,0}},
+    {'2', {0,1,1,1,0, 1,0,0,0,1, 0,0,0,1,0, 0,0,1,0,0, 0,1,0,0,0, 1,1,1,1,1, 0,0,0,0,0}},
+    {'3', {1,1,1,1,0, 0,0,0,0,1, 0,1,1,1,0, 0,0,0,0,1, 0,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0}},
+    {'4', {1,0,0,0,1, 1,0,0,0,1, 1,1,1,1,1, 0,0,0,0,1, 0,0,0,0,1, 0,0,0,0,1, 0,0,0,0,0}},
+    {'5', {1,1,1,1,1, 1,0,0,0,0, 1,1,1,1,0, 0,0,0,0,1, 0,0,0,0,1, 1,1,1,1,0, 0,0,0,0,0}},
+    {'6', {0,1,1,1,0, 1,0,0,0,0, 1,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'7', {1,1,1,1,1, 0,0,0,0,1, 0,0,0,1,0, 0,0,1,0,0, 0,1,0,0,0, 1,0,0,0,0, 0,0,0,0,0}},
+    {'8', {0,1,1,1,0, 1,0,0,0,1, 0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'9', {0,1,1,1,0, 1,0,0,0,1, 1,0,0,0,1, 0,1,1,1,1, 0,0,0,0,1, 0,1,1,1,0, 0,0,0,0,0}},
+    {'%', {1,1,0,0,1, 1,1,0,1,0, 0,0,1,0,0, 0,1,0,1,1, 1,0,0,1,1, 0,0,0,0,0, 0,0,0,0,0}},
+    {'(', {0,0,1,0,0, 0,1,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {')', {0,0,1,0,0, 0,0,0,1,0, 0,0,0,0,1, 0,0,0,0,1, 0,0,0,1,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {'-', {0,0,0,0,0, 0,0,0,0,0, 1,1,1,1,1, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0}},
+    {'!', {0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,0,0,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {'.', {0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {',', {0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,1,0,0, 0,1,0,0,0, 0,0,0,0,0}},
+    {'|', {0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,1,0,0, 0,0,0,0,0}},
+    {'+', {0,0,0,0,0, 0,0,1,0,0, 0,1,1,1,0, 0,0,1,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0}}
+};
+
+// Global Variables
+
+// Game State Variables
+GameState currentGameState = MAIN_MENU;
+Difficulty currentDifficulty = EASY;
+
+// Game Save State
+bool hasSavedGame = false;
+float savedGameTime = 0.0f;
+int savedScore = 0;
+glm::vec3 savedPlayerPosition(0.0f, 0.0f, 0.0f);
+float savedPlayerRotation = 0.0f;
+int savedPlayerHealth = 300;
+Difficulty savedDifficulty = EASY;
+float spawnTimer = 0.0f;
+
+// Player Variables
+glm::vec3 playerPosition(0.0f, 0.0f, 0.0f);
+glm::vec3 playerVelocity(0.0f, 0.0f, 0.0f);
+float playerRotation = 0.0f;
+float playerSpeed = 8.0f;
+float playerBoostSpeed = 16.0f;
+float playerDriftFactor = 0.85f;
+bool isFirstPerson = false;
+int playerHealth = 300;
+int maxPlayerHealth = 300;
+
+// Game Objects
+std::vector<EnemyBoat> enemies;
+std::vector<EnhancedProjectile> allProjectiles;
+std::vector<float> mountainVertices;
+std::vector<unsigned int> mountainIndices;
+std::vector<float> sphereVertices;
+std::vector<unsigned int> sphereIndices;
+
+// Game Stats
+float gameTime = 0.0f;
+int score = 0;
+int enemiesDestroyed = 0;
+int finalScore = 0;
+
+// Shooting Mechanic
+float shootCooldown = 0.0f;
+
+// Wave Animation Variable
+float waveTime = 0.0f;
+
+// Camera Variables for Mouse Control
+float cameraYaw = 0.0f;
+float cameraPitch = 0.0f;
+float cameraDistance = 15.0f;
+float cameraHeight = 8.0f;
+bool firstMouse = true;
+float lastX = WINDOW_WIDTH / 2.0f;
+float lastY = WINDOW_HEIGHT / 2.0f;
+
+// Menu Variables
+int selectedMenuItem = 0;
+int selectedDifficultyItem = 0;
+int selectedSettingsItem = 0;
+int selectedPauseItem = 0;
+bool keyPressed = false;
+
+// Settings Variables
+bool enableRainbowWater = false;
+bool enableCrazyPhysics = false;
+bool enablePartyMode = false;
+int boatSkinIndex = 0;
+const char* boatSkins[] = {"CLASSIC BROWN", "PIRATE BLACK", "ROYAL GOLD", "NEON PINK", "STEALTH GRAY"};
+float musicVolume = 0.7f;
+bool enableScreenShake = true;
+bool enableUnicornMode = false;
+float gameSpeed = 1.0f;
+
+// OpenGL Objects
+unsigned int shaderProgram, textShaderProgram;
+unsigned int shipVAO, waterVAO, skyboxVAO, textVAO, cubeVAO;
+unsigned int mountainVAO, mountainVBO, mountainEBO;
+unsigned int sphereVAO, sphereVBO, sphereEBO;
+unsigned int mountainTexture;
+
+// Function Declarations
+
+
+// Core Functions
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+void mouse_callback(GLFWwindow* window, double xpos, double ypos);
+
+// Input Handling
+void processInput(GLFWwindow* window, float deltaTime);
+void processMenuInput(GLFWwindow* window, float deltaTime);
+void processGameInput(GLFWwindow* window, float deltaTime);
+
+// OpenGL Setup
+unsigned int compileShader(unsigned int type, const char* source);
+unsigned int createShaderProgram();
+unsigned int createTextShaderProgram();
+void setupBuffers();
+void setupTextBuffers();
+void setupMountainBuffers();
+unsigned int loadTexture(const char* path);
+
+// Text Rendering
+void renderText(const std::string& text, float x, float y, float scale, glm::vec3 color);
+void renderCenteredText(const std::string& text, float y, float scale, glm::vec3 color);
+
+// Game Logic
+void initializeEnemies();
+void updateGame(float deltaTime);
+void startNewGame();
+void triggerGameOver();
+void spawnEnemyBasedOnDifficulty();
+void spawnEnemy();
+
+// Collision Detection
+void checkBoundaryCollisions();
+bool checkCollision(glm::vec3 pos1, glm::vec3 pos2, float radius1, float radius2);
+bool isInsideBoundary(glm::vec3 position);
+bool checkMountainCollision(glm::vec3 position);
+
+// Rendering Functions
+void renderGame();
+void renderHUD();
+void renderMenu();
+void renderDifficultyMenu();
+void renderPauseScreen();
+void renderGameOverScreen();
+
+// Drawing Functions
+void drawBoat(glm::vec3 position, float rotation, glm::vec3 scale, glm::vec3 color);
+void drawCube(glm::vec3 position, float rotation, glm::vec3 scale, glm::vec3 color);
+void drawWater();
+void drawSkybox();
+void drawBoundaryWalls();
+void drawMountain(glm::vec3 position, glm::vec3 scale, glm::vec3 color);
+
+// Geometry Generation
+void generateHalfSphere(float radius, int sectors, int stacks, std::vector<float>& vertices, std::vector<unsigned int>& indices);
+void generateSphere(float radius, int sectors, int stacks, std::vector<float>& vertices, std::vector<unsigned int>& indices);
+
+// Utility Functions
+
+bool checkCollision(glm::vec3 pos1, glm::vec3 pos2, float radius1, float radius2) {
+    float distance = glm::length(pos1 - pos2);
+    return distance <= (radius1 + radius2);
+}
+
+bool isInsideBoundary(glm::vec3 position) {
+    return (position.x >= -BOUNDARY_SIZE && position.x <= BOUNDARY_SIZE &&
+            position.z >= -BOUNDARY_SIZE && position.z <= BOUNDARY_SIZE);
+}
+
+bool checkMountainCollision(glm::vec3 position) {
+    const glm::vec3 mountainCenter = glm::vec3(0.0f, -1.0f, 0.0f);
+    const float mountainRadius = 20.0f; 
+    float distance = glm::length(position - mountainCenter);
+    return distance <= mountainRadius;
+}
+
+void checkBoundaryCollisions() {
+    if (!isInsideBoundary(playerPosition)) {
+        playerPosition.x = std::max(-BOUNDARY_SIZE + 1.0f, std::min(BOUNDARY_SIZE - 1.0f, playerPosition.x));
+        playerPosition.z = std::max(-BOUNDARY_SIZE + 1.0f, std::min(BOUNDARY_SIZE - 1.0f, playerPosition.z));
+        static float lastBoundaryMessage = 0.0f;
+        if (glfwGetTime() - lastBoundaryMessage > 1.0f) {
+            std::cout << "🏔️  Boundary wall collision! Can't go further!" << std::endl;
+            lastBoundaryMessage = glfwGetTime();
+        }
+    }
+    
+    for (auto& enemy : enemies) {
+        if (!isInsideBoundary(enemy.position)) {
+            enemy.position.x = std::max(-BOUNDARY_SIZE + 2.0f, std::min(BOUNDARY_SIZE - 2.0f, enemy.position.x));
+            enemy.position.z = std::max(-BOUNDARY_SIZE + 2.0f, std::min(BOUNDARY_SIZE - 2.0f, enemy.position.z));
+        }
+    }
+}
+
+// Geometry Generation Functions
+
+void generateHalfSphere(float radius, int sectors, int stacks, std::vector<float>& vertices, std::vector<unsigned int>& indices) {
+    const float PI = 3.14159265359f;
+    vertices.clear();
+    indices.clear();
+
+    for (int i = 0; i <= stacks; ++i) {
+        float theta = i * (PI / 2.0f) / stacks;
+        for (int j = 0; j <= sectors; ++j) {
+            float phi = j * (2.0f * PI) / sectors;
+            float x = radius * sin(theta) * cos(phi);
+            float y = radius * cos(theta);
+            float z = radius * sin(theta) * sin(phi);
+
+            vertices.push_back(x);
+            vertices.push_back(y);
+            vertices.push_back(z);
+
+            glm::vec3 normal = glm::normalize(glm::vec3(x, y, z));
+            vertices.push_back(normal.x);
+            vertices.push_back(normal.y);
+            vertices.push_back(normal.z);
+
+            float u = (float)j / sectors;
+            float v = (float)i / stacks;
+            vertices.push_back(u);
+            vertices.push_back(v);
+        }
+    }
+
+    for (int i = 0; i < stacks; ++i) {
+        for (int j = 0; j < sectors; ++j) {
+            int k1 = i * (sectors + 1) + j;
+            int k2 = k1 + sectors + 1;
+
+            indices.push_back(k1);
+            indices.push_back(k2);
+            indices.push_back(k1 + 1);
+
+            indices.push_back(k1 + 1);
+            indices.push_back(k2);
+            indices.push_back(k2 + 1);
+        }
+    }
+}
+
+void generateSphere(float radius, int sectors, int stacks, std::vector<float>& vertices, std::vector<unsigned int>& indices) {
+    const float PI = 3.14159265359f;
+    vertices.clear();
+    indices.clear();
+
+    for (int i = 0; i <= stacks; ++i) {
+        float theta = i * PI / stacks;
+        for (int j = 0; j <= sectors; ++j) {
+            float phi = j * 2.0f * PI / sectors;
+            float x = radius * sin(theta) * cos(phi);
+            float y = radius * cos(theta);
+            float z = radius * sin(theta) * sin(phi);
+
+            vertices.push_back(x);
+            vertices.push_back(y);
+            vertices.push_back(z);
+
+            glm::vec3 normal = glm::normalize(glm::vec3(x, y, z));
+            vertices.push_back(normal.x);
+            vertices.push_back(normal.y);
+            vertices.push_back(normal.z);
+
+            float u = (float)j / sectors;
+            float v = (float)i / stacks;
+            vertices.push_back(u);
+            vertices.push_back(v);
+        }
+    }
+
+    for (int i = 0; i < stacks; ++i) {
+        for (int j = 0; j < sectors; ++j) {
+            int k1 = i * (sectors + 1) + j;
+            int k2 = k1 + sectors + 1;
+
+            indices.push_back(k1);
+            indices.push_back(k2);
+            indices.push_back(k1 + 1);
+
+            indices.push_back(k1 + 1);
+            indices.push_back(k2);
+            indices.push_back(k2 + 1);
+        }
+    }
+}
+
+// OpenGL Setup Functions
+
+unsigned int compileShader(unsigned int type, const char* source) {
+    unsigned int shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+
+    int success;
+    char infoLog[512];
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(shader, 512, NULL, infoLog);
+        std::cout << "ERROR::SHADER::COMPILATION_FAILED\n" << infoLog << std::endl;
+    }
+    return shader;
+}
+
+unsigned int createShaderProgram() {
+    unsigned int vertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
+    unsigned int fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
+
+    unsigned int program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+
+    int success;
+    char infoLog[512];
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(program, 512, NULL, infoLog);
+        std::cout << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+    return program;
+}
+
+unsigned int createTextShaderProgram() {
+    unsigned int vertexShader = compileShader(GL_VERTEX_SHADER, textVertexShaderSource);
+    unsigned int fragmentShader = compileShader(GL_FRAGMENT_SHADER, textFragmentShaderSource);
+
+    unsigned int program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+
+    int success;
+    char infoLog[512];
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(program, 512, NULL, infoLog);
+        std::cout << "ERROR::TEXT_SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+    return program;
+}
+
+void setupBuffers() {
+    // Ship VAO
+    unsigned int shipVBO;
+    glGenVertexArrays(1, &shipVAO);
+    glGenBuffers(1, &shipVBO);
+
+    glBindVertexArray(shipVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, shipVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(shipVertices), shipVertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+ 
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Water VAO
+    unsigned int waterVBO;
+    glGenVertexArrays(1, &waterVAO);
+    glGenBuffers(1, &waterVBO);
+
+    glBindVertexArray(waterVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, waterVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(waterVertices), waterVertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+  
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+  
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    // Cube VAO for bullets and smoke particles
+    unsigned int cubeVBO;
+    glGenVertexArrays(1, &cubeVAO);
+    glGenBuffers(1, &cubeVBO);
+
+    glBindVertexArray(cubeVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, cubeVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(cubeVertices), cubeVertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+ 
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Skybox VAO
+    unsigned int skyboxVBO;
+    glGenVertexArrays(1, &skyboxVAO);
+    glGenBuffers(1, &skyboxVBO);
+
+    glBindVertexArray(skyboxVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, skyboxVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(skyboxVertices), skyboxVertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glBindVertexArray(0);
+}
+
+void setupTextBuffers() {
+    float textVertices[] = {
+        0.0f, 1.0f,   0.0f, 1.0f,
+        1.0f, 0.0f,   1.0f, 0.0f,
+        0.0f, 0.0f,   0.0f, 0.0f,
+        
+        0.0f, 1.0f,   0.0f, 1.0f,
+        1.0f, 1.0f,   1.0f, 1.0f,
+        1.0f, 0.0f,   1.0f, 0.0f
+    };
+    
+    unsigned int textVBO;
+    glGenVertexArrays(1, &textVAO);
+    glGenBuffers(1, &textVBO);
+    
+    glBindVertexArray(textVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, textVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(textVertices), textVertices, GL_STATIC_DRAW);
+    
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glBindVertexArray(0);
+}
+
+void setupMountainBuffers() {
+    generateHalfSphere(10.0f, 32, 32, mountainVertices, mountainIndices);
+    glGenVertexArrays(1, &mountainVAO);
+    glGenBuffers(1, &mountainVBO);
+    glGenBuffers(1, &mountainEBO);
+    glBindVertexArray(mountainVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, mountainVBO);
+    glBufferData(GL_ARRAY_BUFFER, mountainVertices.size() * sizeof(float), mountainVertices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mountainEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, mountainIndices.size() * sizeof(unsigned int), mountainIndices.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    generateSphere(1.0f, 16, 16, sphereVertices, sphereIndices);
+    glGenVertexArrays(1, &sphereVAO);
+    glGenBuffers(1, &sphereVBO);
+    glGenBuffers(1, &sphereEBO);
+    glBindVertexArray(sphereVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, sphereVBO);
+    glBufferData(GL_ARRAY_BUFFER, sphereVertices.size() * sizeof(float), sphereVertices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sphereEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sphereIndices.size() * sizeof(unsigned int), sphereIndices.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    glBindVertexArray(0);
+}
+
+unsigned int loadTexture(const char* path) {
+    unsigned int textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    int width, height, nrChannels;
+    unsigned char* data = stbi_load(path, &width, &height, &nrChannels, 0);
+    if (data) {
+        GLenum format = (nrChannels == 4) ? GL_RGBA : GL_RGB;
+        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+    } else {
+        std::cout << "Failed to load texture: " << path << std::endl;
+    }
+    stbi_image_free(data);
+    return textureID;
+}
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+}
+
+void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (currentGameState != PLAYING) return;
+
+    if (firstMouse) {
+        lastX = xpos;
+        lastY = ypos;
+        firstMouse = false;
+    }
+
+    float xoffset = xpos - lastX;
+    float yoffset = lastY - ypos;
+    lastX = xpos;
+    lastY = ypos;
+
+    xoffset *= mouseSensitivity;
+    yoffset *= mouseSensitivity;
+
+    if (isFirstPerson) {
+        playerRotation -= xoffset;
+        while (playerRotation > 180.0f) playerRotation -= 360.0f;
+        while (playerRotation < -180.0f) playerRotation += 360.0f;
+    } else {
+        cameraYaw += xoffset;
+        cameraPitch += yoffset;
+        if (cameraPitch > 89.0f) cameraPitch = 89.0f;
+        if (cameraPitch < -89.0f) cameraPitch = -89.0f;
+    }
+}
+
+// Text Rendering Functions
+
+void renderText(const std::string& text, float x, float y, float scale, glm::vec3 color) {
+    glUseProgram(textShaderProgram);
+    
+    glm::mat4 projection = glm::ortho(0.0f, (float)WINDOW_WIDTH, 0.0f, (float)WINDOW_HEIGHT);
+    unsigned int projLoc = glGetUniformLocation(textShaderProgram, "projection");
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, &projection[0][0]);
+    
+    unsigned int colorLoc = glGetUniformLocation(textShaderProgram, "textColor");
+    glUniform3fv(colorLoc, 1, &color[0]);
+    
+    glBindVertexArray(textVAO);
+    
+    float pixelSize = 3.0f * scale;  
+    float charWidth = 5.0f * pixelSize;   
+    float charHeight = 7.0f * pixelSize; 
+    
+    for (size_t i = 0; i < text.length(); i++) {
+        char c = toupper(text[i]); 
+        
+        if (charBitmaps.find(c) != charBitmaps.end()) {
+            std::vector<int>& bitmap = charBitmaps[c];
+            
+            for (int row = 0; row < 7; row++) {
+                for (int col = 0; col < 5; col++) {
+                    int pixelIndex = row * 5 + col;
+                    if (pixelIndex < bitmap.size() && bitmap[pixelIndex] == 1) {
+                        float xpos = x + i * (charWidth + pixelSize) + col * pixelSize;
+                        float ypos = y + (6 - row) * pixelSize;  
+                        
+                        glm::mat4 model = glm::mat4(1.0f);
+                        model = glm::translate(model, glm::vec3(xpos, ypos, 0.0f));
+                        model = glm::scale(model, glm::vec3(pixelSize, pixelSize, 1.0f));
+                        
+                        unsigned int modelLoc = glGetUniformLocation(textShaderProgram, "model");
+                        if (modelLoc != -1) {
+                            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+                        }
+                        
+                        glDrawArrays(GL_TRIANGLES, 0, 6);
+                    }
+                }
+            }
+        }
+    }
+    
+    glBindVertexArray(0);
+}
+
+void renderCenteredText(const std::string& text, float y, float scale, glm::vec3 color) {
+    float pixelSize = 3.0f * scale;
+    float charWidth = 5.0f * pixelSize;
+    float totalWidth = text.length() * (charWidth + pixelSize) - pixelSize;
+    float x = (WINDOW_WIDTH - totalWidth) / 2.0f;
+    renderText(text, x, y, scale, color);
+}
+
+// Input Handling Functions
+
+void processInput(GLFWwindow* window, float deltaTime) {
+    if (currentGameState == MAIN_MENU || currentGameState == DIFFICULTY_MENU || 
+        currentGameState == SETTINGS_MENU || currentGameState == GAME_OVER || 
+        currentGameState == PAUSED) {
+        processMenuInput(window, deltaTime);
+    } else if (currentGameState == PLAYING) {
+        processGameInput(window, deltaTime);
+    }
+}
+
+void processMenuInput(GLFWwindow* window, float deltaTime) {
+    static bool upPressed = false;
+    static bool downPressed = false;
+    static bool enterPressed = false;
+    static bool escPressed = false;
+    static bool leftPressed = false;
+    static bool rightPressed = false;
+    static bool pPressed = false;
+    
+    bool upKey = glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS;
+    bool downKey = glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
+    bool enterKey = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+    bool escKey = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+    bool leftKey = glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
+    bool rightKey = glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
+    bool pKey = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+    
+    if (currentGameState == MAIN_MENU) {
+        // Main menu navigation
+        if (upKey && !upPressed) {
+            selectedMenuItem = (selectedMenuItem - 1 + mainMenuItemCount) % mainMenuItemCount;
+        }
+        upPressed = upKey;
+        
+        if (downKey && !downPressed) {
+            selectedMenuItem = (selectedMenuItem + 1) % mainMenuItemCount;
+        }
+        downPressed = downKey;
+        
+        if (enterKey && !enterPressed) {
+            switch (selectedMenuItem) {
+                case 0: // Start New Game
+                    currentGameState = DIFFICULTY_MENU;
+                    selectedDifficultyItem = 0;
+                    break;
+                case 1: // Settings
+                    currentGameState = SETTINGS_MENU;
+                    selectedSettingsItem = 0;
+                    break;
+                case 2: // Quit
+                    glfwSetWindowShouldClose(window, true);
+                    break;
+            }
+        }
+        enterPressed = enterKey;
+        
+        if (escKey && !escPressed) {
+            glfwSetWindowShouldClose(window, true);
+        }
+        escPressed = escKey;
+        
+    } else if (currentGameState == DIFFICULTY_MENU) {
+        // Difficulty menu navigation
+        if (upKey && !upPressed) {
+            selectedDifficultyItem = (selectedDifficultyItem - 1 + difficultyMenuItemCount) % difficultyMenuItemCount;
+        }
+        upPressed = upKey;
+        
+        if (downKey && !downPressed) {
+            selectedDifficultyItem = (selectedDifficultyItem + 1) % difficultyMenuItemCount;
+        }
+        downPressed = downKey;
+        
+        if (enterKey && !enterPressed) {
+            if (selectedDifficultyItem == 0) {
+                currentDifficulty = EASY;
+                std::cout << "EASY mode selected!" << std::endl;
+            } else {
+                currentDifficulty = HARD;
+                std::cout << "HARD mode selected!" << std::endl;
+            }
+            startNewGame();
+        }
+        enterPressed = enterKey;
+        
+        if (escKey && !escPressed) {
+            currentGameState = MAIN_MENU;
+            selectedMenuItem = 0;
+        }
+        escPressed = escKey;
+        
+    } else if (currentGameState == SETTINGS_MENU) {
+        // Settings menu navigation
+        if (upKey && !upPressed) {
+            selectedSettingsItem = (selectedSettingsItem - 1 + settingsMenuItemCount) % settingsMenuItemCount;
+        }
+        upPressed = upKey;
+        
+        if (downKey && !downPressed) {
+            selectedSettingsItem = (selectedSettingsItem + 1) % settingsMenuItemCount;
+        }
+        downPressed = downKey;
+        
+        // Settings modification with left/right keys
+        if (leftKey && !leftPressed) {
+            switch (selectedSettingsItem) {
+                case 0: 
+                    enableRainbowWater = !enableRainbowWater;
+                    break;
+                case 1: 
+                    enableCrazyPhysics = !enableCrazyPhysics;
+                    break;
+                case 2: 
+                    enablePartyMode = !enablePartyMode;
+                    break;
+                case 3: 
+                    boatSkinIndex = (boatSkinIndex - 1 + boatSkinCount) % boatSkinCount;
+                    break;
+                case 4: 
+                    musicVolume = std::max(0.0f, musicVolume - 0.1f);
+                    break;
+                case 5: 
+                    enableScreenShake = !enableScreenShake;
+                    break;
+                case 6: 
+                    enableUnicornMode = !enableUnicornMode;
+                    break;
+            }
+        }
+        leftPressed = leftKey;
+        
+        if (rightKey && !rightPressed) {
+            switch (selectedSettingsItem) {
+                case 0: 
+                    enableRainbowWater = !enableRainbowWater;
+                    break;
+                case 1: 
+                    enableCrazyPhysics = !enableCrazyPhysics;
+                    break;
+                case 2: 
+                    enablePartyMode = !enablePartyMode;
+                    break;
+                case 3: 
+                    boatSkinIndex = (boatSkinIndex + 1) % boatSkinCount;
+                    break;
+                case 4: 
+                    musicVolume = std::min(1.0f, musicVolume + 0.1f);
+                    break;
+                case 5: 
+                    enableScreenShake = !enableScreenShake;
+                    break;
+                case 6: 
+                    enableUnicornMode = !enableUnicornMode;
+                    break;
+            }
+        }
+        rightPressed = rightKey;
+        
+        if (escKey && !escPressed) {
+            currentGameState = MAIN_MENU;
+            selectedMenuItem = 0;
+        }
+        escPressed = escKey;
+        
+    } else if (currentGameState == PAUSED) {
+        // Pause menu navigation
+        if (upKey && !upPressed) {
+            selectedPauseItem = (selectedPauseItem - 1 + pauseMenuItemCount) % pauseMenuItemCount;
+        }
+        upPressed = upKey;
+        
+        if (downKey && !downPressed) {
+            selectedPauseItem = (selectedPauseItem + 1) % pauseMenuItemCount;
+        }
+        downPressed = downKey;
+        
+        if (enterKey && !enterPressed) {
+            switch (selectedPauseItem) {
+                case 0: // Continue Game
+                    currentGameState = PLAYING;
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                    std::cout << "▶️  Game resumed!" << std::endl;
+                    break;
+                case 1: // Exit to Main Menu
+                    currentGameState = MAIN_MENU;
+                    selectedMenuItem = 0;
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                    std::cout << "🏠 Returning to main menu..." << std::endl;
+                    break;
+            }
+        }
+        enterPressed = enterKey;
+        
+        if (escKey && !escPressed || (pKey && !pPressed)) {
+            currentGameState = PLAYING;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            std::cout << "▶️  Game resumed!" << std::endl;
+        }
+        escPressed = escKey;
+        pPressed = pKey;
+        
+    } else if (currentGameState == GAME_OVER) {
+        if (enterKey && !enterPressed) {
+            currentGameState = MAIN_MENU;
+            selectedMenuItem = 0;
+        }
+        enterPressed = enterKey;
+        
+        if (escKey && !escPressed) {
+            currentGameState = MAIN_MENU;
+            selectedMenuItem = 0;
+        }
+        escPressed = escKey;
+    }
+}
+
+void processGameInput(GLFWwindow* window, float deltaTime) {
+    static bool spacePressed = false;
+    static bool fPressed = false;
+    static bool pPressed = false;
+    static bool onePressed = false;
+    static bool twoPressed = false;
+
+    bool oneKey = glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS;
+    bool twoKey = glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS;
+
+    if (oneKey && !onePressed) {
+        isFirstPerson = true;
+    }
+    if (twoKey && !twoPressed) {
+        isFirstPerson = false;
+    }
+    onePressed = oneKey;
+    twoPressed = twoKey;
+    
+    // Pause (P key)
+    bool pKey = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+    if (pKey && !pPressed) {
+        currentGameState = PAUSED;
+        selectedPauseItem = 0;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        std::cout << "⏸️  Game paused!" << std::endl;
+        return;
+    }
+    pPressed = pKey;
+    
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        currentGameState = MAIN_MENU;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        std::cout << "🏠 Returning to main menu..." << std::endl;
+        return;
+    }
+
+    // Boost (Shift key)
+    bool boosting = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || 
+                    glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    float currentSpeed = boosting ? playerBoostSpeed : playerSpeed;
+    currentSpeed *= gameSpeed;
+    glm::vec3 oldPosition = playerPosition;
+    
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+        playerPosition.x += sin(glm::radians(playerRotation)) * currentSpeed * deltaTime;
+        playerPosition.z += cos(glm::radians(playerRotation)) * currentSpeed * deltaTime;
+    }
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+        playerPosition.x -= sin(glm::radians(playerRotation)) * currentSpeed * 0.7f * deltaTime;
+        playerPosition.z -= cos(glm::radians(playerRotation)) * currentSpeed * 0.7f * deltaTime;
+    }
+    
+    // Check boundary collision
+    if (!isInsideBoundary(playerPosition)) {
+        playerPosition = oldPosition;
+    }
+    
+    // Check mountain collision
+    if (checkMountainCollision(playerPosition)) {
+        playerPosition = oldPosition; 
+        static float lastMountainMessage = 0.0f;
+        if (glfwGetTime() - lastMountainMessage > 1.0f) {
+            std::cout << "⛰️ Mountain collision! Can't pass through!" << std::endl;
+            lastMountainMessage = glfwGetTime();
+        }
+    }
+    
+    // Rotation
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+        playerRotation += 90.0f * deltaTime;
+    }
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+        playerRotation -= 90.0f * deltaTime;
+    }
+    
+    // Shooting Projectiles 
+    bool spaceKey = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+    bool fKey = glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS;
+    
+    if ((spaceKey && !spacePressed) || (fKey && !fPressed)) {
+        if (shootCooldown <= 0.0f) {
+            std::cout << "🔫 Player shooting! Cooldown: " << shootCooldown << std::endl;
+            glm::vec3 projectilePos = playerPosition + glm::vec3(
+                sin(glm::radians(playerRotation)) * 2.0f,
+                -0.8f,  
+                cos(glm::radians(playerRotation)) * 2.0f
+            );
+            
+            glm::vec3 projectileVel = glm::vec3(
+                sin(glm::radians(playerRotation)) * 20.0f,
+                0.0f,
+                cos(glm::radians(playerRotation)) * 20.0f
+            );
+            
+            allProjectiles.push_back(EnhancedProjectile(projectilePos, projectileVel, true));
+            std::cout << "➡️ Player projectile added. Total: " << allProjectiles.size() << std::endl;
+            shootCooldown = 0.1f; 
+        } else {
+            std::cout << "⏳ Shoot cooldown active: " << shootCooldown << std::endl;
+        }
+    }
+    
+    spacePressed = spaceKey;
+    fPressed = fKey;
+}
+
+// Game Logic Functions
+
+void initializeEnemies() {
+    enemies.clear();
+    
+    int initialEnemyCount = (currentDifficulty == EASY) ? 15 : 30;
+    
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> posDist(-BOUNDARY_SIZE + 15.0f, BOUNDARY_SIZE - 15.0f);
+    
+    for (int i = 0; i < initialEnemyCount; i++) {
+        glm::vec3 pos;
+        int attempts = 0;
+        bool validPosition = false;
+        
+        do {
+            pos = glm::vec3(posDist(gen), 0.0f, posDist(gen));
+            attempts++;
+            
+            validPosition = true;
+            
+            if (glm::length(pos - playerPosition) < 8.0f) {
+                validPosition = false;
+                continue;
+            }
+            
+            for (const auto& enemy : enemies) {
+                if (glm::length(pos - enemy.position) < 3.0f) {
+                    validPosition = false;
+                    break;
+                }
+            }
+            
+            if (checkMountainCollision(pos)) {
+                validPosition = false;
+            }
+            
+        } while (!validPosition && attempts < 50);
+        
+        if (validPosition) {
+            enemies.push_back(EnemyBoat(pos));
+        }
+    }
+    
+    std::cout << "⚔️  Spawned " << enemies.size() << " enemy boats with proper spacing" << std::endl;
+}
+
+void updateGame(float deltaTime) {
+    if (shootCooldown > 0.0f) {
+        shootCooldown -= deltaTime;
+    }
+    
+    waveTime += deltaTime * waveSpeed;
+    
+    spawnTimer += deltaTime;
+    if (spawnTimer >= 1.0f) {
+        int enemiesToSpawn = (currentDifficulty == EASY) ? 1 : 2;
+        for (int i = 0; i < enemiesToSpawn; i++) {
+            spawnEnemy();
+        }
+        spawnTimer = 0.0f;
+    }
+    
+    for (auto it = allProjectiles.begin(); it != allProjectiles.end();) {
+        it->position += it->velocity * deltaTime;
+
+        if (checkMountainCollision(it->position)) {
+            it = allProjectiles.erase(it);
+            continue;
+        }
+        
+        it->lifetime -= deltaTime;
+        
+        if (!it->isPlayerOwned) {
+            it->smokeTimer += deltaTime;
+            if (it->smokeTimer >= 0.1f) {
+                it->smokeTrail.push_back(it->position);
+                it->smokeTimer = 0.0f;
+                if (it->smokeTrail.size() > 8) {
+                    it->smokeTrail.erase(it->smokeTrail.begin());
+                }
+            }
+        }
+        
+        if (it->lifetime <= 0.0f || !isInsideBoundary(it->position)) {
+            it = allProjectiles.erase(it);
+            continue;
+        }
+        
+        if (it->isPlayerOwned) {
+            bool hitEnemy = false;
+            for (auto& enemy : enemies) {
+                if (!enemy.active) continue;
+                
+                if (checkCollision(it->position, enemy.position, 0.5f, 2.0f)) {
+                    enemy.active = false;
+                    score += 100;
+                    enemiesDestroyed++;
+                    std::cout << "💥 Enemy destroyed! Score: " << score << std::endl;
+                    hitEnemy = true;
+                    break;
+                }
+            }
+            
+            if (hitEnemy) {
+                it = allProjectiles.erase(it);
+                continue;
+            }
+        } else {
+            if (checkCollision(it->position, playerPosition, 0.5f, 1.5f)) {
+                playerHealth -= 20;
+                std::cout << "💔 HIT! Player health: " << playerHealth << "/" << maxPlayerHealth << std::endl;
+                it = allProjectiles.erase(it);
+                if (playerHealth <= 0) {
+                    triggerGameOver();
+                }
+                continue;
+            }
+        }
+        
+        ++it;
+    }
+    
+    for (size_t i = 0; i < enemies.size(); i++) {
+        auto& enemy = enemies[i];
+        if (!enemy.active) continue;
+        
+        if (enemy.shootCooldown > 0.0f) {
+            enemy.shootCooldown -= deltaTime;
+        }
+        
+        glm::vec3 dirToPlayer = playerPosition - enemy.position;
+        float distanceToPlayer = glm::length(dirToPlayer);
+        
+        const float minPlayerDistance = 5.0f;
+        glm::vec3 oldEnemyPosition = enemy.position;
+        if (distanceToPlayer > minPlayerDistance + 3.0f) {
+            dirToPlayer = glm::normalize(dirToPlayer);
+            glm::vec3 newPos = enemy.position + dirToPlayer * enemy.speed * deltaTime;
+            if (isInsideBoundary(newPos)) {
+                enemy.position = newPos;
+            }
+        } else if (distanceToPlayer < minPlayerDistance) {
+            dirToPlayer = glm::normalize(dirToPlayer);
+            enemy.position = enemy.position - dirToPlayer * enemy.speed * deltaTime * 0.5f;
+        }
+        
+        if (checkMountainCollision(enemy.position)) {
+            enemy.position = oldEnemyPosition;
+        }
+        
+        const float minEnemyDistance = 2.0f;
+        for (size_t j = 0; j < enemies.size(); j++) {
+            if (i == j || !enemies[j].active) continue;
+            
+            glm::vec3 dirToOtherEnemy = enemy.position - enemies[j].position;
+            float distanceToOtherEnemy = glm::length(dirToOtherEnemy);
+            
+            if (distanceToOtherEnemy < minEnemyDistance && distanceToOtherEnemy > 0.1f) {
+                dirToOtherEnemy = glm::normalize(dirToOtherEnemy);
+                enemy.position += dirToOtherEnemy * (minEnemyDistance - distanceToOtherEnemy) * 0.5f * deltaTime * 10.0f;
+            }
+        }
+        
+        if (distanceToPlayer > 0.1f) {
+            dirToPlayer = glm::normalize(dirToPlayer);
+            enemy.rotation = atan2(dirToPlayer.x, dirToPlayer.z) * 180.0f / glm::pi<float>();
+        }
+        
+        if (distanceToPlayer <= 25.0f && distanceToPlayer > minPlayerDistance && enemy.shootCooldown <= 0.0f) {
+            std::cout << "🔫 Enemy shooting! Distance: " << distanceToPlayer << std::endl;
+            glm::vec3 projectilePos = enemy.position + glm::vec3(
+                sin(glm::radians(enemy.rotation)) * 2.0f,
+                -0.8f,
+                cos(glm::radians(enemy.rotation)) * 2.0f
+            );
+            glm::vec3 projectileVel = glm::normalize(dirToPlayer) * 8.0f;
+            allProjectiles.push_back(EnhancedProjectile(projectilePos, projectileVel, false));
+            std::cout << "➡️ Enemy projectile added. Total: " << allProjectiles.size() << std::endl;
+            enemy.shootCooldown = enemy.maxShootCooldown;
+        }
+    }
+}
+
+void startNewGame() {
+    std::cout << " Starting enhanced game..." << std::endl;
+    
+    // Reset Game State
+    playerPosition = glm::vec3(30.0f, 0.0f, 30.0f);
+    playerVelocity = glm::vec3(0.0f, 0.0f, 0.0f);
+    playerRotation = 0.0f;
+    playerHealth = maxPlayerHealth; // Start with 300 HP
+    score = 0;
+    gameTime = 0.0f;
+    shootCooldown = 0.0f;
+    enemiesDestroyed = 0;
+    allProjectiles.clear();
+    
+    // Reset camera
+    cameraYaw = 0.0f;
+    cameraPitch = 0.0f;
+    firstMouse = true;
+    
+    if (enableCrazyPhysics) {
+        playerSpeed = 15.0f;
+        playerBoostSpeed = 30.0f;
+        std::cout << "CRAZY PHYSICS ACTIVATED! Super speed enabled!" << std::endl;
+    } else {
+        playerSpeed = 8.0f;
+        playerBoostSpeed = 16.0f;
+    }
+    
+    initializeEnemies();
+    currentGameState = PLAYING;
+    glfwSetInputMode(glfwGetCurrentContext(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    
+    hasSavedGame = false;
+    
+    if (enableUnicornMode) {
+        std::cout << "🦄✨ UNICORN MODE ACTIVATED! Magical adventure awaits! ✨🦄" << std::endl;
+    }
+    if (enablePartyMode) {
+        std::cout << "🎉 PARTY MODE ON! Let's get this boat party started! 🎉" << std::endl;
+    }
+    
+    std::cout << "Enhanced game features active:" << std::endl;
+    std::cout << "   Boundary walls with collision detection" << std::endl;
+    std::cout << "   Dynamic water animation with sunlight" << std::endl;
+    std::cout << "   Cubic bullets and smoke particles" << std::endl;
+    std::cout << "   300 HP health system" << std::endl;
+    std::cout << "   Real-time HUD display" << std::endl;
+    std::cout << "   Enhanced enemy AI (500cm player distance, 200cm enemy separation)" << std::endl;
+    std::cout << "   Pause functionality (Press P)" << std::endl;
+    std::cout << "   Difficulty: " << (currentDifficulty == EASY ? "EASY" : "HARD") << std::endl;
+}
+
+void triggerGameOver() {
+    std::cout << "GAME OVER! Final Score: " << score << std::endl;
+    std::cout << "Enemies Destroyed: " << enemiesDestroyed << std::endl;
+    std::cout << "Survival Time: " << (int)gameTime << " seconds" << std::endl;
+    
+    // Store final score for game over screen
+    finalScore = score;
+
+    currentGameState = GAME_OVER;
+
+    glfwSetInputMode(glfwGetCurrentContext(), GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+}
+
+void spawnEnemyBasedOnDifficulty() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> angleDist(0.0f, 2.0f * glm::pi<float>());
+    
+    int enemiesToSpawn = (currentDifficulty == EASY) ? 1 : 3;
+    
+    for (int i = 0; i < enemiesToSpawn; i++) {
+        if (enemies.size() >= 15) break;
+        
+        float angle = angleDist(gen);
+        float distance = BOUNDARY_SIZE * 0.6f;
+        glm::vec3 spawnPos;
+        bool validPosition = false;
+        int attempts = 0;
+        
+        do {
+            spawnPos = glm::vec3(cos(angle) * distance, 0.0f, sin(angle) * distance);
+            attempts++;
+            validPosition = true;
+            
+            // Check distance from player (minimum 500cm = 5.0 units)
+            if (glm::length(spawnPos - playerPosition) < 8.0f) {
+                validPosition = false;
+            }
+            
+            // Check distance from other enemies (minimum 200cm = 2.0 units)
+            for (const auto& enemy : enemies) {
+                if (enemy.active && glm::length(spawnPos - enemy.position) < 3.0f) {
+                    validPosition = false;
+                    break;
+                }
+            }
+            
+            // Check for mountain collision
+            if (checkMountainCollision(spawnPos)) {
+                validPosition = false;
+            }
+
+            if (!validPosition) {
+                angle = angleDist(gen);
+            }
+            
+        } while (!validPosition && attempts < 50);
+        
+        if (validPosition && isInsideBoundary(spawnPos)) {
+            enemies.push_back(EnemyBoat(spawnPos));
+            std::cout << "New enemy spawned! (" << (currentDifficulty == EASY ? "EASY" : "HARD") << " mode)" << std::endl;
+        }
+    }
+    
+    std::cout << "⚔️  Total enemies: " << enemies.size() << std::endl;
+}
+
+void spawnEnemy() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> posDist(-BOUNDARY_SIZE + 15.0f, BOUNDARY_SIZE - 15.0f);
+    
+    glm::vec3 pos;
+    int attempts = 0;
+    bool validPosition = false;
+    
+    do {
+        pos = glm::vec3(posDist(gen), 0.0f, posDist(gen));
+        attempts++;
+        
+        validPosition = true;
+        
+        if (glm::length(pos - playerPosition) < 8.0f) {
+            validPosition = false;
+            continue;
+        }
+        
+        for (const auto& enemy : enemies) {
+            if (enemy.active && glm::length(pos - enemy.position) < 3.0f) {
+                validPosition = false;
+                break;
+            }
+        }
+        
+        if (checkMountainCollision(pos)) {
+            validPosition = false;
+        }
+        
+    } while (!validPosition && attempts < 50);
+    
+    if (validPosition) {
+        enemies.push_back(EnemyBoat(pos));
+        std::cout << " New enemy spawned!" << std::endl;
+    }
+}
+
+// Rendering Functions
+
+void renderHUD() {
+    glDisable(GL_DEPTH_TEST);
+    
+    // Health bar background
+    glUseProgram(textShaderProgram);
+    glm::mat4 projection = glm::ortho(0.0f, (float)WINDOW_WIDTH, 0.0f, (float)WINDOW_HEIGHT);
+    unsigned int projLoc = glGetUniformLocation(textShaderProgram, "projection");
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, &projection[0][0]);
+    
+    glBindVertexArray(textVAO);
+    
+    // Health bar background (red)
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(20.0f, WINDOW_HEIGHT - 40.0f, 0.0f));
+    model = glm::scale(model, glm::vec3(300.0f, 20.0f, 1.0f));
+    unsigned int modelLoc = glGetUniformLocation(textShaderProgram, "model");
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    unsigned int colorLoc = glGetUniformLocation(textShaderProgram, "textColor");
+    glUniform3f(colorLoc, 0.8f, 0.1f, 0.1f); // Red background
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    
+    // Health bar foreground (green)
+    float healthPercent = (float)playerHealth / (float)maxPlayerHealth;
+    model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(20.0f, WINDOW_HEIGHT - 40.0f, 0.0f));
+    model = glm::scale(model, glm::vec3(300.0f * healthPercent, 20.0f, 1.0f));
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    glUniform3f(colorLoc, 0.1f, 0.8f, 0.1f); // Green health
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    
+    glBindVertexArray(0);
+    
+    // Text Information
+    renderText("HEALTH: " + std::to_string(playerHealth) + "/" + std::to_string(maxPlayerHealth), 
+               20.0f, WINDOW_HEIGHT - 70.0f, 1.2f, glm::vec3(1.0f, 1.0f, 1.0f));
+    
+    renderText("SCORE: " + std::to_string(score), 
+               20.0f, WINDOW_HEIGHT - 100.0f, 1.2f, glm::vec3(1.0f, 1.0f, 0.0f));
+    
+    renderText("TIME: " + std::to_string((int)gameTime) + "S", 
+               20.0f, WINDOW_HEIGHT - 130.0f, 1.2f, glm::vec3(0.7f, 0.7f, 1.0f));
+    
+    renderText("ENEMIES DESTROYED: " + std::to_string(enemiesDestroyed), 
+               20.0f, WINDOW_HEIGHT - 160.0f, 1.2f, glm::vec3(1.0f, 0.5f, 0.5f));
+    
+    // Difficulty Indicator
+    std::string difficultyText = "DIFFICULTY: " + std::string(currentDifficulty == EASY ? "EASY" : "HARD");
+    renderText(difficultyText, 
+               20.0f, WINDOW_HEIGHT - 190.0f, 1.2f, glm::vec3(0.9f, 0.6f, 0.9f));
+    
+    // Simple controls Reminder (bottom) 
+    renderText("WASD:MOVE | SHIFT:BOOST | SPACE:SHOOT | P:PAUSE | ESC:MENU", 
+               150.0f, 30.0f, 1.0f, glm::vec3(0.8f, 0.8f, 0.8f));
+    
+    glEnable(GL_DEPTH_TEST);
+}
+
+void renderGame() {
+    glClearColor(0.5f, 0.8f, 1.0f, 1.0f); // Sky blue
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgram(shaderProgram);
+
+    glm::mat4 projection = glm::perspective(glm::radians(45.0f), 
+        (float)WINDOW_WIDTH / (float)WINDOW_HEIGHT, 0.1f, 1000.0f);
+    
+    glm::mat4 view;
+    if (isFirstPerson) {
+        glm::vec3 forward = glm::vec3(sin(glm::radians(playerRotation)), 0.0f, cos(glm::radians(playerRotation)));
+        glm::vec3 eye = playerPosition + glm::vec3(0.0f, 0.5f, 0.0f);
+        glm::vec3 center = eye + forward;
+        view = glm::lookAt(eye, center, glm::vec3(0.0f, 1.0f, 0.0f));
+    } else {
+        float cameraX = playerPosition.x + cameraDistance * cos(glm::radians(cameraYaw)) * cos(glm::radians(cameraPitch));
+        float cameraY = playerPosition.y + cameraHeight + cameraDistance * sin(glm::radians(cameraPitch));
+        float cameraZ = playerPosition.z + cameraDistance * sin(glm::radians(cameraYaw)) * cos(glm::radians(cameraPitch));
+        glm::vec3 cameraPos = glm::vec3(cameraX, cameraY, cameraZ);
+        view = glm::lookAt(cameraPos, playerPosition, glm::vec3(0.0f, 1.0f, 0.0f));
+    }
+    
+    unsigned int projLoc = glGetUniformLocation(shaderProgram, "projection");
+    unsigned int viewLoc = glGetUniformLocation(shaderProgram, "view");
+    unsigned int lightPosLoc = glGetUniformLocation(shaderProgram, "lightPos");
+    unsigned int lightColorLoc = glGetUniformLocation(shaderProgram, "lightColor");
+    unsigned int viewPosLoc = glGetUniformLocation(shaderProgram, "viewPos");
+    unsigned int timeLoc = glGetUniformLocation(shaderProgram, "time");
+    unsigned int isWaterLoc = glGetUniformLocation(shaderProgram, "isWater");
+    
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, &projection[0][0]);
+    glUniformMatrix4fv(viewLoc, 1, GL_FALSE, &view[0][0]);
+
+    // Sunlight Positioning
+    glUniform3f(lightPosLoc, 50.0f, 80.0f, 30.0f);
+    glUniform3f(lightColorLoc, 1.0f, 0.95f, 0.8f); 
+    glUniform3fv(viewPosLoc, 1, &playerPosition[0]); 
+    glUniform1f(timeLoc, waveTime);
+
+    drawSkybox();
+    drawWater();
+    drawBoundaryWalls();
+    drawMountain(glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(1.0f, 1.0f, 1.0f));
+
+    // Draw player boat with selected skin
+    glm::vec3 playerBoatColor;
+    switch (boatSkinIndex) {
+        case 0: // Classic Brown
+            playerBoatColor = glm::vec3(0.8f, 0.6f, 0.4f);
+            break;
+        case 1: // Pirate Black
+            playerBoatColor = glm::vec3(0.2f, 0.2f, 0.2f);
+            break;
+        case 2: // Royal Gold
+            playerBoatColor = glm::vec3(1.0f, 0.8f, 0.2f);
+            break;
+        case 3: // Neon Pink
+            playerBoatColor = glm::vec3(1.0f, 0.2f, 0.8f);
+            break;
+        case 4: // Stealth Gray
+            playerBoatColor = glm::vec3(0.5f, 0.5f, 0.6f);
+            break;
+        default:
+            playerBoatColor = glm::vec3(0.8f, 0.6f, 0.4f);
+    }
+    
+    // Applies unicorn mode rainbow effect to player boat
+    if (enableUnicornMode) {
+        float time = glfwGetTime();
+        playerBoatColor = glm::vec3(
+            sin(time * 3.0f) * 0.5f + 0.5f,
+            sin(time * 3.0f + 2.0f) * 0.5f + 0.5f,
+            sin(time * 3.0f + 4.0f) * 0.5f + 0.5f
+        );
+    }
+    
+    // Applies screen shake effect if enabled
+    glm::vec3 shakeOffset = glm::vec3(0.0f);
+    if (enableScreenShake && playerHealth < 150) {
+        float shakeIntensity = (150 - playerHealth) / 150.0f * 0.2f;
+        shakeOffset = glm::vec3(
+            sin(glfwGetTime() * 20.0f) * shakeIntensity,
+            0.0f,
+            cos(glfwGetTime() * 25.0f) * shakeIntensity
+        );
+    }
+ 
+    glUniform1i(isWaterLoc, 0);
+
+    glm::vec3 playerBoatPosition = playerPosition + shakeOffset;
+    playerBoatPosition.y = -0.9f; 
+    drawBoat(playerBoatPosition, playerRotation, glm::vec3(1.0f, 0.6f, 2.0f), playerBoatColor);
+
+    // enemy boats 
+    for (const auto& enemy : enemies) {
+        if (enemy.active) {
+            glm::vec3 enemyBoatPosition = enemy.position;
+            enemyBoatPosition.y = -0.9f; 
+            drawBoat(enemyBoatPosition, enemy.rotation, glm::vec3(1.8f, 1.0f, 3.0f), glm::vec3(0.8f, 0.2f, 0.2f));
+        }
+    }
+    
+    // Projectiles as Cubes 
+    for (const auto& projectile : allProjectiles) {
+        if (projectile.active) {
+            glm::vec3 projectilePos = projectile.position;
+            projectilePos.y = -0.8f; 
+            
+            if (projectile.isPlayerOwned) {
+                // Player projectiles (yellow cubes)
+                drawCube(projectilePos, 0.0f, glm::vec3(0.3f, 0.3f, 0.3f), glm::vec3(1.0f, 1.0f, 0.0f));
+            } else {
+                // Enemy projectiles (orange cubes)
+                drawCube(projectilePos, 0.0f, glm::vec3(0.25f, 0.25f, 0.25f), glm::vec3(1.0f, 0.5f, 0.0f));
+                
+                // Cubic smoke trail for enemy bullets 
+                for (const auto& smokePos : projectile.smokeTrail) {
+                    glm::vec3 smokePosition = smokePos;
+                    smokePosition.y = -0.8f; 
+                    drawCube(smokePosition, 0.0f, glm::vec3(0.15f, 0.15f, 0.15f), glm::vec3(0.5f, 0.5f, 0.5f)); // Gray cubic smoke
+                }
+            }
+        }
+    }
+}
+
+void renderMenu() {
+    glClearColor(0.1f, 0.2f, 0.4f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    if (currentGameState == MAIN_MENU) {
+        glDisable(GL_DEPTH_TEST);
+        renderCenteredText("BOAT ESCAPE", 550.0f, 3.0f, glm::vec3(1.0f, 1.0f, 0.0f));
+        
+        // Menu items 
+        glm::vec3 normalColor = glm::vec3(0.8f, 0.8f, 0.8f);
+        glm::vec3 selectedColor = glm::vec3(1.0f, 1.0f, 0.0f);
+        
+        renderCenteredText("START", 420.0f, 2.0f, 
+                   selectedMenuItem == 0 ? selectedColor : normalColor);
+        
+        renderCenteredText("SETTINGS", 370.0f, 2.0f, 
+                   selectedMenuItem == 1 ? selectedColor : normalColor);
+        
+        renderCenteredText("QUIT", 320.0f, 2.0f, 
+                   selectedMenuItem == 2 ? selectedColor : normalColor);
+        
+        renderCenteredText("USE W/S TO SELECT", 250.0f, 1.2f, glm::vec3(0.6f, 0.6f, 0.6f));
+        renderCenteredText("PRESS ENTER", 220.0f, 1.2f, glm::vec3(0.6f, 0.6f, 0.6f));
+        renderCenteredText("300 HP | BOUNDARIES | DYNAMIC WATER", 150.0f, 1.0f, glm::vec3(0.9f, 0.9f, 0.9f));
+        renderCenteredText("CUBIC BULLETS | SMART AI | HUD", 120.0f, 1.0f, glm::vec3(0.9f, 0.9f, 0.9f));
+        
+        glEnable(GL_DEPTH_TEST);
+        
+    } else if (currentGameState == SETTINGS_MENU) {
+        glDisable(GL_DEPTH_TEST);
+        renderCenteredText("SETTINGS", 600.0f, 2.5f, glm::vec3(0.0f, 1.0f, 1.0f));
+        
+        // Settings items
+        glm::vec3 normalColor = glm::vec3(0.8f, 0.8f, 0.8f);
+        glm::vec3 selectedColor = glm::vec3(0.0f, 1.0f, 1.0f);
+        
+        renderText("RAINBOW WATER: " + std::string(enableRainbowWater ? "ON" : "OFF"), 200.0f, 520.0f, 1.5f, 
+                   selectedSettingsItem == 0 ? selectedColor : normalColor);
+        
+        renderText("CRAZY PHYSICS: " + std::string(enableCrazyPhysics ? "ON" : "OFF"), 200.0f, 480.0f, 1.5f, 
+                   selectedSettingsItem == 1 ? selectedColor : normalColor);
+        
+        renderText("PARTY MODE: " + std::string(enablePartyMode ? "ON" : "OFF"), 200.0f, 440.0f, 1.5f, 
+                   selectedSettingsItem == 2 ? selectedColor : normalColor);
+        
+        renderText("BOAT SKIN: " + std::string(boatSkins[boatSkinIndex]), 200.0f, 400.0f, 1.5f, 
+                   selectedSettingsItem == 3 ? selectedColor : normalColor);
+        
+        renderText("MUSIC: " + std::to_string((int)(musicVolume * 100)) + "%", 200.0f, 360.0f, 1.5f, 
+                   selectedSettingsItem == 4 ? selectedColor : normalColor);
+        
+        renderText("SCREEN SHAKE: " + std::string(enableScreenShake ? "ON" : "OFF"), 200.0f, 320.0f, 1.5f, 
+                   selectedSettingsItem == 5 ? selectedColor : normalColor);
+        
+        renderText("UNICORN MODE: " + std::string(enableUnicornMode ? "ON" : "OFF"), 200.0f, 280.0f, 1.5f, 
+                   selectedSettingsItem == 6 ? selectedColor : normalColor);
+        
+        renderCenteredText("USE A/D TO CHANGE", 200.0f, 1.2f, glm::vec3(0.6f, 0.6f, 0.6f));
+        renderCenteredText("ESC TO GO BACK", 170.0f, 1.2f, glm::vec3(0.6f, 0.6f, 0.6f));
+        
+        glEnable(GL_DEPTH_TEST);
+    }
+}
+
+void renderDifficultyMenu() {
+    glClearColor(0.1f, 0.2f, 0.4f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+    renderCenteredText("SELECT DIFFICULTY", 550.0f, 2.5f, glm::vec3(1.0f, 0.5f, 0.0f));
+    
+    // Difficulty options
+    glm::vec3 normalColor = glm::vec3(0.8f, 0.8f, 0.8f);
+    glm::vec3 selectedColor = glm::vec3(1.0f, 1.0f, 0.0f);
+    
+    // Easy option 
+    renderCenteredText("EASY", 450.0f, 2.5f, 
+               selectedDifficultyItem == 0 ? selectedColor : normalColor);
+    renderCenteredText("1 ENEMY SPAWNS FOR EACH DESTROYED", 410.0f, 1.2f, 
+               selectedDifficultyItem == 0 ? glm::vec3(0.7f, 1.0f, 0.7f) : glm::vec3(0.6f, 0.6f, 0.6f));
+    
+    // Hard option 
+    renderCenteredText("HARD", 330.0f, 2.5f, 
+               selectedDifficultyItem == 1 ? selectedColor : normalColor);
+    renderCenteredText("3 ENEMIES SPAWN FOR EACH DESTROYED", 290.0f, 1.2f, 
+               selectedDifficultyItem == 1 ? glm::vec3(1.0f, 0.7f, 0.7f) : glm::vec3(0.6f, 0.6f, 0.6f));
+    
+    // Instructions 
+    renderCenteredText("USE W/S TO SELECT", 200.0f, 1.2f, glm::vec3(0.6f, 0.6f, 0.6f));
+    renderCenteredText("PRESS ENTER", 170.0f, 1.2f, glm::vec3(0.6f, 0.6f, 0.6f));
+    renderCenteredText("ESC TO GO BACK", 140.0f, 1.2f, glm::vec3(0.6f, 0.6f, 0.6f));
+    
+    glEnable(GL_DEPTH_TEST);
+}
+
+void renderPauseScreen() {
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+
+    glUseProgram(textShaderProgram);
+    glm::mat4 projection = glm::ortho(0.0f, (float)WINDOW_WIDTH, 0.0f, (float)WINDOW_HEIGHT);
+    unsigned int projLoc = glGetUniformLocation(textShaderProgram, "projection");
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, &projection[0][0]);
+    
+    glBindVertexArray(textVAO);
+    
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, glm::vec3(0.0f, 0.0f, 0.0f));
+    model = glm::scale(model, glm::vec3(WINDOW_WIDTH, WINDOW_HEIGHT, 1.0f));
+    unsigned int modelLoc = glGetUniformLocation(textShaderProgram, "model");
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    unsigned int colorLoc = glGetUniformLocation(textShaderProgram, "textColor");
+    glUniform3f(colorLoc, 0.0f, 0.0f, 0.0f); 
+    
+    for (int i = 0; i < 3; i++) {
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    
+    glBindVertexArray(0);
+    
+    // Pause menu content 
+    renderCenteredText("GAME PAUSED", 500.0f, 3.0f, glm::vec3(1.0f, 1.0f, 0.0f));
+    
+    // Pause menu options
+    glm::vec3 normalColor = glm::vec3(0.9f, 0.9f, 0.9f);
+    glm::vec3 selectedColor = glm::vec3(1.0f, 1.0f, 0.0f);
+    
+    renderCenteredText("CONTINUE", 400.0f, 2.0f, 
+               selectedPauseItem == 0 ? selectedColor : normalColor);
+    
+    renderCenteredText("EXIT TO MAIN MENU", 350.0f, 2.0f, 
+               selectedPauseItem == 1 ? selectedColor : normalColor);
+    
+    // Instructions 
+    renderCenteredText("USE W/S TO SELECT", 250.0f, 1.2f, glm::vec3(0.8f, 0.8f, 0.8f));
+    renderCenteredText("PRESS ENTER OR P TO CONTINUE", 220.0f, 1.2f, glm::vec3(0.8f, 0.8f, 0.8f));
+    renderCenteredText("ESC TO GO BACK", 190.0f, 1.2f, glm::vec3(0.8f, 0.8f, 0.8f));
+    
+    glEnable(GL_DEPTH_TEST);
+}
+
+void renderGameOverScreen() {
+    // Screen with dark red background
+    glClearColor(0.3f, 0.1f, 0.1f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    glDisable(GL_DEPTH_TEST);
+    
+    // Game Over title 
+    renderCenteredText("GAME OVER", 550.0f, 3.0f, glm::vec3(1.0f, 0.2f, 0.2f));
+    
+    // Final stats 
+    renderCenteredText("FINAL SCORE: " + std::to_string(finalScore), 450.0f, 2.0f, glm::vec3(1.0f, 1.0f, 0.0f));
+    renderCenteredText("ENEMIES DESTROYED: " + std::to_string(enemiesDestroyed), 400.0f, 1.8f, glm::vec3(0.9f, 0.9f, 0.9f));
+    renderCenteredText("SURVIVAL TIME: " + std::to_string((int)gameTime) + " SECONDS", 360.0f, 1.8f, glm::vec3(0.7f, 0.9f, 1.0f));
+    
+    // Difficulty info 
+    std::string difficultyText = "DIFFICULTY: " + std::string(currentDifficulty == EASY ? "EASY" : "HARD");
+    renderCenteredText(difficultyText, 320.0f, 1.8f, glm::vec3(0.9f, 0.6f, 0.9f));
+    
+    // Performance message 
+    if (finalScore >= 1000) {
+        renderCenteredText("EXCELLENT PERFORMANCE!", 260.0f, 1.5f, glm::vec3(0.2f, 1.0f, 0.2f));
+    } else if (finalScore >= 500) {
+        renderCenteredText("GOOD JOB!", 260.0f, 1.5f, glm::vec3(0.8f, 0.8f, 0.2f));
+    } else {
+        renderCenteredText("KEEP PRACTICING!", 260.0f, 1.5f, glm::vec3(0.8f, 0.6f, 0.2f));
+    }
+    
+    // Return instruction
+    renderCenteredText("PRESS ENTER TO RETURN TO MAIN MENU", 150.0f, 1.3f, glm::vec3(0.8f, 0.8f, 0.8f));
+    
+    glEnable(GL_DEPTH_TEST);
+}
+
+// Drawing Functions
+
+void drawBoat(glm::vec3 position, float rotation, glm::vec3 scale, glm::vec3 color) {
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, position);
+    model = glm::rotate(model, glm::radians(rotation), glm::vec3(0.0f, 1.0f, 0.0f));
+    model = glm::scale(model, scale);
+
+    unsigned int modelLoc = glGetUniformLocation(shaderProgram, "model");
+    unsigned int colorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+    
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    glUniform3fv(colorLoc, 1, &color[0]);
+
+    glBindVertexArray(shipVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 60);
+}
+
+void drawCube(glm::vec3 position, float rotation, glm::vec3 scale, glm::vec3 color) {
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, position);
+    model = glm::rotate(model, glm::radians(rotation), glm::vec3(0.0f, 1.0f, 0.0f));
+    model = glm::scale(model, scale);
+
+    unsigned int modelLoc = glGetUniformLocation(shaderProgram, "model");
+    unsigned int colorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+    
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    glUniform3fv(colorLoc, 1, &color[0]);
+
+    glBindVertexArray(cubeVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+}
+
+void drawWater() {
+    // Animated Water
+    glm::mat4 model = glm::mat4(1.0f);
+    
+    unsigned int modelLoc = glGetUniformLocation(shaderProgram, "model");
+    unsigned int colorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+    unsigned int isWaterLoc = glGetUniformLocation(shaderProgram, "isWater");
+    
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    glUniform1i(isWaterLoc, 1); 
+    
+    if (enableRainbowWater) {
+        float time = glfwGetTime();
+        glm::vec3 rainbowColor = glm::vec3(
+            sin(time * 2.0f) * 0.3f + 0.4f,
+            sin(time * 2.0f + 2.0f) * 0.3f + 0.4f,
+            sin(time * 2.0f + 4.0f) * 0.3f + 0.4f
+        );
+        glUniform3fv(colorLoc, 1, &rainbowColor[0]);
+    } else if (enableUnicornMode) {
+        float time = glfwGetTime();
+        glm::vec3 magicalColor = glm::vec3(
+            0.8f + sin(time * 3.0f) * 0.2f,
+            0.4f + cos(time * 2.5f) * 0.3f,
+            0.9f + sin(time * 4.0f) * 0.1f
+        );
+        glUniform3fv(colorLoc, 1, &magicalColor[0]);
+    } else {
+        glUniform3f(colorLoc, 0.1f, 0.5f, 0.8f); 
+    }
+
+    glBindVertexArray(waterVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+void drawBoundaryWalls() {
+    unsigned int isWaterLoc = glGetUniformLocation(shaderProgram, "isWater");
+    glUniform1i(isWaterLoc, 0);
+    
+    glm::vec3 wallColor = glm::vec3(0.6f, 0.4f, 0.2f); 
+    
+    //Walls
+    drawCube(glm::vec3(0.0f, (BOUNDARY_HEIGHT/2) - 1.0f, BOUNDARY_SIZE + BOUNDARY_THICKNESS/2), 
+             0.0f, 
+             glm::vec3(BOUNDARY_SIZE * 2 + BOUNDARY_THICKNESS, BOUNDARY_HEIGHT, BOUNDARY_THICKNESS), 
+             wallColor);
+    
+    drawCube(glm::vec3(0.0f, (BOUNDARY_HEIGHT/2) - 1.0f, -BOUNDARY_SIZE - BOUNDARY_THICKNESS/2), 
+             0.0f, 
+             glm::vec3(BOUNDARY_SIZE * 2 + BOUNDARY_THICKNESS, BOUNDARY_HEIGHT, BOUNDARY_THICKNESS), 
+             wallColor);
+    
+    drawCube(glm::vec3(BOUNDARY_SIZE + BOUNDARY_THICKNESS/2, (BOUNDARY_HEIGHT/2) - 1.0f, 0.0f), 
+             0.0f, 
+             glm::vec3(BOUNDARY_THICKNESS, BOUNDARY_HEIGHT, BOUNDARY_SIZE * 2), 
+             wallColor);
+    
+    drawCube(glm::vec3(-BOUNDARY_SIZE - BOUNDARY_THICKNESS/2, (BOUNDARY_HEIGHT/2) - 1.0f, 0.0f), 
+             0.0f, 
+             glm::vec3(BOUNDARY_THICKNESS, BOUNDARY_HEIGHT, BOUNDARY_SIZE * 2), 
+             wallColor);
+}
+
+void drawSkybox() {
+    glDepthMask(GL_FALSE);
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, playerPosition);
+    glm::vec3 skyColor = glm::vec3(0.5f, 0.8f, 1.0f); 
+    
+    unsigned int modelLoc = glGetUniformLocation(shaderProgram, "model");
+    unsigned int colorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+    unsigned int isWaterLoc = glGetUniformLocation(shaderProgram, "isWater");
+    
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    glUniform3fv(colorLoc, 1, &skyColor[0]);
+    glUniform1i(isWaterLoc, 0); 
+
+    glBindVertexArray(skyboxVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+
+    glDepthMask(GL_TRUE);
+}
+
+void drawMountain(glm::vec3 position, glm::vec3 scale, glm::vec3 color) {
+    glUseProgram(shaderProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, mountainTexture);
+    unsigned int textureLoc = glGetUniformLocation(shaderProgram, "texture1");
+    glUniform1i(textureLoc, 0);
+    unsigned int isWaterLoc = glGetUniformLocation(shaderProgram, "isWater");
+    glUniform1i(isWaterLoc, 0);
+
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, position);
+    model = glm::scale(model, scale);
+    unsigned int modelLoc = glGetUniformLocation(shaderProgram, "model");
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    unsigned int colorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+    glUniform3fv(colorLoc, 1, &color[0]);
+
+    glBindVertexArray(mountainVAO);
+    glDrawElements(GL_TRIANGLES, mountainIndices.size(), GL_UNSIGNED_INT, 0);
+
+    float large_size = 4.5f;
+    float medium_size = 3.0f;
+    float small_size = 1.5f;
+    float mountainRadius = 10.0f * scale.x; 
+    float startAngle = glm::radians(30.0f);
+    float endAngle = glm::radians(150.0f);
+    float angleStep = (endAngle - startAngle) / 2.0f;
+    glm::vec3 mountain_center = position; 
+
+    for (int i = 0; i < 3; ++i) {
+        float angle = startAngle + (i * angleStep);
+        float xOffset = mountainRadius * cos(angle);
+        float yOffset = mountainRadius * sin(angle);
+
+        glm::vec3 spherePosLeft = position + glm::vec3(xOffset, yOffset, 0.0f);
+        glm::vec3 normal_left = glm::normalize(spherePosLeft - mountain_center);
+
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, spherePosLeft);
+        model = glm::scale(model, glm::vec3(large_size));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+        glBindVertexArray(sphereVAO);
+        glDrawElements(GL_TRIANGLES, sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+        glm::vec3 offset_left = (i == 2) ? glm::vec3(normal_left.y, -normal_left.x, 0.0f) * 2.0f : glm::vec3(0.0f);
+
+        glm::vec3 mediumPosLeft = spherePosLeft + (large_size + medium_size) * normal_left + offset_left;
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, mediumPosLeft);
+        model = glm::scale(model, glm::vec3(medium_size));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+        glm::vec3 smallPosLeft = mediumPosLeft + (medium_size + small_size) * normal_left;
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, smallPosLeft);
+        model = glm::scale(model, glm::vec3(small_size));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+        glm::vec3 spherePosRight = position + glm::vec3(-xOffset, yOffset, 0.0f);
+        glm::vec3 normal_right = glm::normalize(spherePosRight - mountain_center);
+
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, spherePosRight);
+        model = glm::scale(model, glm::vec3(large_size));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+        glm::vec3 offset_right = (i == 2) ? glm::vec3(-normal_right.y, normal_right.x, 0.0f) * 2.0f : glm::vec3(0.0f);
+
+        glm::vec3 mediumPosRight = spherePosRight + (large_size + medium_size) * normal_right + offset_right;
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, mediumPosRight);
+        model = glm::scale(model, glm::vec3(medium_size));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, sphereIndices.size(), GL_UNSIGNED_INT, 0);
+
+        glm::vec3 smallPosRight = mediumPosRight + (medium_size + small_size) * normal_right;
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, smallPosRight);
+        model = glm::scale(model, glm::vec3(small_size));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+        glDrawElements(GL_TRIANGLES, sphereIndices.size(), GL_UNSIGNED_INT, 0);
+    }
+
+    glBindVertexArray(0);
+}
+
+// Main Function
+
+
+int main() {
+    std::cout << "🌊 Starting Enhanced Boat Escape Game!" << std::endl;
+    
+    // Initialize GLFW
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
+
+    GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Enhanced Boat Escape", NULL, NULL);
+    if (window == NULL) {
+        std::cout << "❌ Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glfwSetCursorPosCallback(window, mouse_callback);
+    
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+    // Initialize GLEW
+    if (glewInit() != GLEW_OK) {
+        std::cout << "❌ Failed to initialize GLEW" << std::endl;
+        return -1;
+    }
+
+    // Configure OpenGL
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Build shader programs
+    shaderProgram = createShaderProgram();
+    textShaderProgram = createTextShaderProgram();
+    
+    setupBuffers();
+    setupTextBuffers();
+
+    initializeEnemies();
+
+    mountainTexture = loadTexture("texture/ice and snow.png");
+    setupMountainBuffers();
+
+    float deltaTime = 0.0f;
+    float lastFrame = 0.0f;
+
+    std::cout << "✅ Game initialized successfully!" << std::endl;
+    std::cout << "📋 Features: Boundaries, Dynamic Water, 300HP, Cubic Bullets & Smoke" << std::endl;
+
+    while (!glfwWindowShouldClose(window)) {
+
+        float currentFrame = glfwGetTime();
+        deltaTime = currentFrame - lastFrame;
+        lastFrame = currentFrame;
+        
+        processInput(window, deltaTime);
+
+        if (currentGameState == MAIN_MENU) {
+            renderMenu();
+        } else if (currentGameState == DIFFICULTY_MENU) {
+            renderDifficultyMenu();
+        } else if (currentGameState == SETTINGS_MENU) {
+            renderMenu();
+        } else if (currentGameState == PLAYING) {
+            gameTime += deltaTime;
+            updateGame(deltaTime);
+            checkBoundaryCollisions();
+            renderGame();
+            renderHUD();
+        } else if (currentGameState == PAUSED) {
+            renderGame(); 
+            renderHUD();
+            renderPauseScreen(); 
+        } else if (currentGameState == GAME_OVER) {
+            renderGameOverScreen();
+        }
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    glDeleteVertexArrays(1, &shipVAO);
+    glDeleteVertexArrays(1, &waterVAO);
+    glDeleteVertexArrays(1, &cubeVAO);
+    glDeleteProgram(shaderProgram);
+    glDeleteVertexArrays(1, &mountainVAO);
+    glDeleteBuffers(1, &mountainVBO);
+    glDeleteBuffers(1, &mountainEBO);
+    glDeleteVertexArrays(1, &sphereVAO);
+    glDeleteBuffers(1, &sphereVBO);
+    glDeleteBuffers(1, &sphereEBO);
+    glDeleteTextures(1, &mountainTexture);
+    glfwTerminate();
+    return 0;
+}

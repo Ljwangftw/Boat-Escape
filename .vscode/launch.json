@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "C++ (lldb) Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            // This is the most important change:
+            "program": "${workspaceFolder}/main",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb", // Use lldb on macOS
+            // Link to the build task you created earlier
+            "preLaunchTask": "Build C++ on macOS"
+        }
+    ]
+}

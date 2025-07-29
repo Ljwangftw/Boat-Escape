@@ -1,0 +1,35 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build C++ on macOS",
+            "type": "shell",
+            "command": "clang++",
+            "args": [
+                "-std=c++17",
+                "-g",
+                "${workspaceFolder}/src/main.cpp",
+                // Use environment variable for Homebrew path (works on Apple Silicon & Intel)
+                "-I${env:HOMEBREW_PREFIX}/include",
+                "-I${workspaceFolder}/include",
+                "-L${env:HOMEBREW_PREFIX}/lib",
+                "-lglew",
+                "-lglfw",
+                // Link necessary macOS frameworks
+                "-framework", "OpenGL",
+                "-framework", "Cocoa",
+                "-framework", "IOKit",
+                "-o",
+                "${workspaceFolder}/main"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "detail": "Compiler: clang++"
+        }
+    ]
+}
