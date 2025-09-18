@@ -89,7 +89,7 @@ If the game doesn''t work:
 
 ---
 
-That''s it! Have fun playing!
+That's it! Have fun playing!
 
 ## Authors
 
