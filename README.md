@@ -8,7 +8,7 @@ A 3D boat combat game where you fight enemy boats on the water and try to surviv
 ## What You Do
 - Drive your boat around a lake
 - Shoot enemy boats to destroy them
-- Don't let enemies destroy you
+- Don''t let enemies destroy you
 - Survive as long as you can
 
 ---
@@ -43,6 +43,33 @@ A 3D boat combat game where you fight enemy boats on the water and try to surviv
 
 ---
 
+## Download Options
+
+### Browse Only
+- Use the GitHub web UI to view the README, code, and commit history.
+
+### Clone with Git LFS (recommended)
+1. Install Git and Git LFS (one-time):
+   - Windows: `winget install Git.Git`
+   - macOS: `brew install git-lfs`
+   - Linux: use your package manager (e.g., `sudo apt install git-lfs`)
+2. Enable LFS: `git lfs install`
+3. Clone the repository: `git clone https://github.com/Ljwangftw/Boat-Escape.git`
+4. If you already have a clone, run `git lfs pull` to download the full `.glb` models.
+5. Open the project and follow *How to Run the Game*.
+
+### Pre-packaged ZIP
+- Download `Boat-Escape-full.zip` from the repository [Releases](https://github.com/Ljwangftw/Boat-Escape/releases/latest) page. This archive is generated from the LFS-enabled working tree so it already contains the full-size `.glb` models.
+- Extract the archive and run the project as described above.
+
+---
+
+## Recruiter Notes
+- The repo uses Git LFS for large `.glb` models; GitHub''s default "Download ZIP" only contains 1 KB pointer files.
+- The *Pre-packaged ZIP* release asset or a full Git clone are the two ways to get the ready-to-run project with assets.
+
+---
+
 ## Game Info
 
 - You start with **300 health**.
@@ -55,14 +82,14 @@ A 3D boat combat game where you fight enemy boats on the water and try to surviv
 
 ## Need Help?
 
-If the game doesn't work:
+If the game doesn''t work:
 - Make sure your computer supports **OpenGL 3.3** (most computers after 2010 do).
 - Update your graphics card drivers.
 - Try running as administrator (`sudo` on Linux/macOS).
 
 ---
 
-That's it! Have fun playing!
+That''s it! Have fun playing!
 
 ## Authors
 
