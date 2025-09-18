@@ -1,0 +1,12 @@
+# Build artifacts
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
+*.cache
+# IDE folders
+.vscode/
+# OS generated
+Thumbs.db
+.DS_Store
