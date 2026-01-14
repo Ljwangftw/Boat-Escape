@@ -48,16 +48,6 @@ A 3D boat combat game where you fight enemy boats on the water and try to surviv
 ### Browse Only
 - Use the GitHub web UI to view the README, code, and commit history.
 
-### Clone with Git LFS (recommended)
-1. Install Git and Git LFS (one-time):
-   - Windows: `winget install Git.Git`
-   - macOS: `brew install git-lfs`
-   - Linux: use your package manager (e.g., `sudo apt install git-lfs`)
-2. Enable LFS: `git lfs install`
-3. Clone the repository: `git clone https://github.com/Ljwangftw/Boat-Escape.git`
-4. If you already have a clone, run `git lfs pull` to download the full `.glb` models.
-5. Open the project and follow *How to Run the Game*.
-
 ### Pre-packaged ZIP
 - Download `Boat-Escape-full.zip` from the repository [Releases](https://github.com/Ljwangftw/Boat-Escape/releases/latest) page. This archive is generated from the LFS-enabled working tree so it already contains the full-size `.glb` models.
 - Extract the archive and run the project as described above.
